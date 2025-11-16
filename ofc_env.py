@@ -121,6 +121,91 @@ def catname_3(weight: int, tiebreak: Tuple) -> str:
     inv = {v:k for k,v in THREE_ORDER.items()}
     return inv[weight]
 
+
+def _pad_tiebreak(values: Tuple[int, ...], target: int = 5) -> Tuple[int, ...]:
+    """Pad tiebreak tuples with sentinel ranks so lexicographic compare works."""
+    arr = list(values)
+    while len(arr) < target:
+        arr.append(-1)
+    return tuple(arr)
+
+
+def _top_as_five_equivalent(hand: Tuple[int, Tuple[int, ...]]) -> Tuple[int, Tuple[int, ...]]:
+    """
+    Top(3枚)の役を 5枚役の序数にマッピングし、同じ長さのキッカー配列に整形する。
+    こうすることで Top vs Middle を通常の 5枚手同士の比較と同様に扱える。
+    """
+    wt_top, tb_top = hand
+    if wt_top == THREE_ORDER["SET"]:
+        mapped = FIVE_ORDER["TRIPS"]
+        tb = (tb_top[0],)
+    elif wt_top == THREE_ORDER["PAIR"]:
+        mapped = FIVE_ORDER["PAIR"]
+        tb = (tb_top[0], tb_top[1])
+    else:
+        mapped = FIVE_ORDER["HIGH"]
+        tb = tuple(tb_top)
+    return mapped, _pad_tiebreak(tb)
+
+
+def describe_top_hand(cards: List[Card]) -> str:
+    """Top行（3枚）の役名と詳細を返す。"""
+    if len(cards) != 3:
+        return f"INCOMPLETE({len(cards)})"
+    wt, tb = eval_3(cards)
+    name = catname_3(wt, tb)
+    if name == "SET":
+        rank = RANKS[tb[0]]
+        return f"SET ({rank}{rank}{rank})"
+    if name == "PAIR":
+        pair = RANKS[tb[0]]
+        kicker = RANKS[tb[1]]
+        return f"PAIR ({pair}{pair} / kicker {kicker})"
+    highs = " ".join(RANKS[r] for r in tb)
+    return f"HIGH ({highs})"
+
+
+def describe_five_hand(cards: List[Card]) -> str:
+    """Middle / Bottom（5枚）の役名と詳細を返す。"""
+    if len(cards) != 5:
+        return f"INCOMPLETE({len(cards)})"
+    wt, tb = eval_5(cards)
+    name = catname_5(wt, tb)
+    if name == "HIGH":
+        highs = " ".join(RANKS[r] for r in tb)
+        return f"HIGH ({highs})"
+    if name == "PAIR":
+        pair = RANKS[tb[0]]
+        kickers = " ".join(RANKS[r] for r in tb[1:])
+        return f"PAIR ({pair}{pair} / kickers {kickers})"
+    if name == "TWO_PAIR":
+        high_pair = RANKS[tb[0]]
+        low_pair = RANKS[tb[1]]
+        kicker = RANKS[tb[2]]
+        return f"TWO_PAIR ({high_pair}{high_pair} & {low_pair}{low_pair} / kicker {kicker})"
+    if name == "TRIPS":
+        trip = RANKS[tb[0]]
+        kickers = " ".join(RANKS[r] for r in tb[1:])
+        return f"TRIPS ({trip}{trip}{trip} / kickers {kickers})"
+    if name == "STRAIGHT":
+        high = RANKS[tb[0]]
+        return f"STRAIGHT (high {high})"
+    if name == "FLUSH":
+        ranks_txt = " ".join(RANKS[r] for r in tb)
+        return f"FLUSH ({ranks_txt})"
+    if name == "FULLHOUSE":
+        trip = RANKS[tb[0]]
+        pair = RANKS[tb[1]]
+        return f"FULLHOUSE ({trip}{trip}{trip} over {pair}{pair})"
+    if name == "QUADS":
+        quad = RANKS[tb[0]]
+        kicker = RANKS[tb[1]]
+        return f"QUADS ({quad}{quad}{quad}{quad} / kicker {kicker})"
+    if name == "SFLUSH":
+        high = RANKS[tb[0]]
+        return f"SFLUSH (high {high})"
+    return name
+
 # ===== 盤面・環境 =====
 @dataclass
 class Line:
@@ -283,34 +368,19 @@ class OFCEnv:
         wt_top, tb_top = a  # 3枚役
         wt_mid, tb_mid = b  # 5枚役
 
-        # Top HIGH → Middle は PAIR 以上必須
-        if wt_top == THREE_ORDER["HIGH"]:
-            return wt_mid >= FIVE_ORDER["PAIR"]
+        top_weight, top_tb = _top_as_five_equivalent((wt_top, tb_top))
+        mid_tb = _pad_tiebreak(tb_mid)
 
-        # Top PAIR
-        if wt_top == THREE_ORDER["PAIR"]:
-            if wt_mid < FIVE_ORDER["PAIR"]:
-                return False
-            if wt_mid >= FIVE_ORDER["TWO_PAIR"]:
-                return True
-            # PAIR vs PAIR：ペア階級で Middle が上なら OK
-            return tb_mid[0] > tb_top[0]
-
-        # Top SET (Trips)
-        if wt_top == THREE_ORDER["SET"]:
-            if wt_mid < FIVE_ORDER["TRIPS"]:
-                return False
-            if wt_mid == FIVE_ORDER["TRIPS"]:
-                return tb_mid[0] > tb_top[0]
-            return True
-
-        return False
+        if top_weight != wt_mid:
+            return top_weight <= wt_mid
+        return top_tb <= mid_tb
 
     def _lt_5v5(self, a: Tuple[int,Tuple], b: Tuple[int,Tuple]) -> bool:
         wa, ta = a
         wb, tb = b
-        if wa != wb: return wa < wb
-        return ta < tb
+        if wa != wb:
+            return wa <= wb
+        return _pad_tiebreak(ta) <= _pad_tiebreak(tb)
 
     def _terminal_reward(self, s: OFCState) -> float:
         rt = self._roy_top(s.top.cards)

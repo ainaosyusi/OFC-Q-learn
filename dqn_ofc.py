@@ -17,8 +17,8 @@ from ofc_env import (
     RANK2IDX,
     eval_3,
     eval_5,
-    catname_3,
-    catname_5,
+    describe_top_hand,
+    describe_five_hand,
 )
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -638,7 +638,9 @@ def run_test(model_path="./ckpt/ofc_qnet.pt", seed=None, max_branch=128):
         s, r, done, _ = env.step(a)
         total_r += r
     print("報酬:", total_r, "ファウル:", s.foul)
-    print("Top役:", catname_3(*eval_3(s.top.cards)), " Mid役:", catname_5(*eval_5(s.mid.cards)), " Bot役:", catname_5(*eval_5(s.bot.cards)))
+    print("Top役:", describe_top_hand(s.top.cards))
+    print("Mid役:", describe_five_hand(s.mid.cards))
+    print("Bot役:", describe_five_hand(s.bot.cards))
     print("Top:", s.top.cards)
     print("Mid:", s.mid.cards)
     print("Bot:", s.bot.cards)
