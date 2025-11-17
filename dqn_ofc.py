@@ -1,6 +1,6 @@
 # dqn_ofc.py (patched)
 import os, math, random
-from collections import deque, namedtuple
+from collections import deque, namedtuple, Counter
 from typing import List, Tuple, Any, Union
 
 import numpy as np
@@ -8,7 +8,18 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from ofc_env import OFCEnv, OFCState, Line, RANKS, SUITS, eval_3, eval_5, catname_3, catname_5
+from ofc_env import (
+    OFCEnv,
+    OFCState,
+    Line,
+    RANKS,
+    SUITS,
+    RANK2IDX,
+    eval_3,
+    eval_5,
+    describe_top_hand,
+    describe_five_hand,
+)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -263,12 +274,161 @@ def filter_by_foul_montecarlo(env: OFCEnv, acts, samples=12, threshold=0.7, seed
 
     return kept if kept else acts
 
+
+# ---------------------------
+# Heuristic action prior
+# ---------------------------
+def _preview_state_after_action(state: OFCState, action):
+    """軽量コピー後に action を適用し、盤面のみ更新した状態を返す"""
+
+    st = OFCState()
+    st.top.cards = list(state.top.cards)
+    st.mid.cards = list(state.mid.cards)
+    st.bot.cards = list(state.bot.cards)
+    st.dead = list(state.dead)
+    st.incoming = list(state.incoming)
+    st.turn = state.turn
+    st.foul = state.foul
+
+    if state.turn == 0:
+        for card, dst in zip(state.incoming, action):
+            if dst == "T":
+                st.top.cards.append(card)
+            elif dst == "M":
+                st.mid.cards.append(card)
+            else:
+                st.bot.cards.append(card)
+        st.incoming = []
+        st.turn = 1
+    else:
+        d, p1, p2 = action
+        cards = list(state.incoming)
+        if not cards:
+            return st
+        discard_card = cards[d]
+        st.dead.append(discard_card)
+        keep = [cards[i] for i in range(len(cards)) if i != d]
+        for card, dst in zip(keep, (p1, p2)):
+            if dst == "T":
+                st.top.cards.append(card)
+            elif dst == "M":
+                st.mid.cards.append(card)
+            else:
+                st.bot.cards.append(card)
+        st.incoming = []
+        st.turn = min(4, state.turn + 1)
+
+    return st
+
+
+def _line_summary(cards, cap, is_top=False):
+    ranks = [RANK2IDX[c[0]] for c in cards]
+    suits = Counter([c[1] for c in cards])
+    cnt = Counter(ranks)
+    pair_ranks = sorted([r for r, c in cnt.items() if c >= 2], reverse=True)
+    trips_ranks = sorted([r for r, c in cnt.items() if c >= 3], reverse=True)
+    fill = len(cards) / cap
+    strength = sum(ranks)
+    if trips_ranks:
+        strength += 30 + trips_ranks[0] * 1.5
+    elif pair_ranks:
+        strength += 12 + pair_ranks[0]
+    flush_potential = max(suits.values()) if suits else 0
+    high = max(ranks) if ranks else -1
+    two_pair = len(pair_ranks) >= 2 if not is_top else False
+    return {
+        "fill": fill,
+        "pair": pair_ranks[0] if pair_ranks else None,
+        "trips": trips_ranks[0] if trips_ranks else None,
+        "two_pair": two_pair,
+        "strength": strength,
+        "flush": flush_potential,
+        "high": high,
+        "len": len(cards),
+        "space": cap - len(cards),
+    }
+
+
+def _heuristic_board_score(st: OFCState) -> float:
+    top = _line_summary(st.top.cards, 3, is_top=True)
+    mid = _line_summary(st.mid.cards, 5)
+    bot = _line_summary(st.bot.cards, 5)
+
+    score = 0.0
+
+    # 基本：ボトム重視だがミドル/トップも埋める
+    score += 2.0 * bot["fill"] + 1.4 * mid["fill"] + 0.8 * top["fill"]
+
+    # ボトムに偏り過ぎると罰
+    score -= 1.3 * max(0.0, bot["fill"] - mid["fill"] - 0.25)
+    score -= 0.8 * max(0.0, mid["fill"] - top["fill"] - 0.35)
+
+    # ミドルは常にボトムより弱く
+    if bot["fill"] >= 0.4 and mid["fill"] >= 0.4 and mid["strength"] >= bot["strength"]:
+        score -= 1.5
+
+    # ミドルに弱ペアを置いたら罰
+    if mid["pair"] is not None and mid["pair"] < RANK2IDX["Q"] and mid["fill"] < 1.0:
+        score -= 1.1
+
+    # ボトムでセット / 2ペア確定なら加点
+    if bot["trips"] is not None:
+        score += 0.9 + 0.05 * bot["trips"]
+    elif bot["two_pair"]:
+        score += 0.6
+    elif bot["pair"] is not None:
+        score += 0.35 + 0.03 * bot["pair"]
+
+    # Topの扱い：QQ+で大きく加点、ただしミドル/ボトムが未整備なら抑制
+    if top["pair"] is not None:
+        if top["pair"] >= RANK2IDX["Q"]:
+            if mid["fill"] >= 0.5 and bot["fill"] >= 0.5:
+                score += 1.2 + 0.08 * top["pair"]
+            else:
+                score += 0.3  # 構えるだけ
+        elif top["fill"] < 1.0 and (mid["fill"] < 0.4 or bot["fill"] < 0.4):
+            score -= 0.8
+
+    # Topがハイカード中心なら微加点
+    if top["high"] >= RANK2IDX.get("K", 11):
+        score += 0.2
+    if top["high"] >= RANK2IDX.get("A", 12) and top["len"] >= 2:
+        score += 0.2
+
+    # Flush ドロー維持
+    if mid["flush"] >= 3 and mid["space"] >= 2:
+        score += 0.25
+    if bot["flush"] >= 3 and bot["space"] >= 2:
+        score += 0.3
+
+    # Top だけが進みすぎている場合の罰
+    score -= 0.4 * max(0, top["len"] - mid["len"] - 1)
+    score -= 0.4 * max(0, top["len"] - bot["len"] - 1)
+
+    return score
+
+
+def heuristic_rank_actions(state: OFCState, acts, keep: int = 64):
+    scored = []
+    for a in acts:
+        st = _preview_state_after_action(state, a)
+        scored.append((_heuristic_board_score(st), a))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    if keep is not None and keep > 0 and len(scored) > keep:
+        scored = scored[:keep]
+    return [a for _, a in scored]
+
 # ---------------------------
 # 4) ε-greedy（可変行動：候補から選ぶ）
 # ---------------------------
-def select_action(env: OFCEnv, qnet: QNet, state_vec: np.ndarray, epsilon: float, max_branch=96):
+def select_action(env: OFCEnv, qnet: QNet, state_vec: np.ndarray, epsilon: float, max_branch=96, heuristic_keep=64):
     acts = env.legal_actions(max_samples=max_branch)
     acts = filter_by_foul_montecarlo(env, acts, samples=12, threshold=0.7, seed=777)  # early-foul mask
+    if env.state is not None:
+        keep = None
+        if heuristic_keep is not None:
+            keep = min(len(acts), heuristic_keep)
+        acts = heuristic_rank_actions(env.state, acts, keep=keep)
 
     if not acts:
         return None, acts
@@ -464,6 +624,7 @@ def run_test(model_path="./ckpt/ofc_qnet.pt", seed=None, max_branch=128):
     while not done:
         s_vec = encode_state(s)
         acts = env.legal_actions(max_samples=max_branch)
+        acts = heuristic_rank_actions(env.state, acts, keep=None)
         qs = []
         for a in acts:
             a_vec = encode_action(s, a)
@@ -477,7 +638,9 @@ def run_test(model_path="./ckpt/ofc_qnet.pt", seed=None, max_branch=128):
         s, r, done, _ = env.step(a)
         total_r += r
     print("報酬:", total_r, "ファウル:", s.foul)
-    print("Top役:", catname_3(*eval_3(s.top.cards)), " Mid役:", catname_5(*eval_5(s.mid.cards)), " Bot役:", catname_5(*eval_5(s.bot.cards)))
+    print("Top役:", describe_top_hand(s.top.cards))
+    print("Mid役:", describe_five_hand(s.mid.cards))
+    print("Bot役:", describe_five_hand(s.bot.cards))
     print("Top:", s.top.cards)
     print("Mid:", s.mid.cards)
     print("Bot:", s.bot.cards)
