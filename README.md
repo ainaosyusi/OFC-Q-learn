@@ -21,4 +21,13 @@ python dqn_ofc_multi.py --train --episodes 1000 --n_players 2 --hero_idx 0 --see
 # 学習済みモデルで1回だけ試す
 python dqn_ofc_multi.py --test --n_players 2 --hero_idx 0 --seed 11
 3人プレイなら：
-python dqn_ofc_multi.py --train --episodes 50000 --n_players 3 --hero_idx 0
+python dqn_ofc_multi.py --train --episodes 1000 --n_players 3 --hero_idx 0
+
+
+python dqn_ofc_multi.py --eval 1000 --n_players 2 --hero_idx 0 --seed 11
+
+# 実験A：2人戦、ベースライン
+python dqn_ofc_multi.py --train --episodes 50000 --n_players 2 --hero_idx 0 --seed 11
+
+# 実験B：3人戦
+python dqn_ofc_multi.py --train --episodes 50000 --n_players 3 --hero_idx 0 --seed 11
