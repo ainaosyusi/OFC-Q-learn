@@ -272,8 +272,8 @@ def train(
         ret, traj = play_episode(env, qnet, epsilon, gamma=gamma)
 
         # バッファに追加
-        for (s_vec, a_vec, r, s2_vec, done) in traj:
-            buf.push(s_vec, a_vec, r, s2_vec, done)
+        for (s_vec, a_vec, _r_step, s2_vec, done) in traj:
+            buf.push(s_vec, a_vec, ret, s2_vec, done)
 
         # 学習ステップ
         if len(buf) >= start_learning:

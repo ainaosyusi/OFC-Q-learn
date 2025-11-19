@@ -457,35 +457,32 @@ class OFCMultiEnv:
     def _compute_hero_reward(self) -> float:
         hero = self.players[self.hero_idx]
         hero_foul = hero.foul
+        n_opp = self.n_players - 1
 
-        # ヒーローの役情報
-        if not hero_foul:
-            h_top = eval_3(hero.top.cards)
-            h_mid = eval_5(hero.mid.cards)
-            h_bot = eval_5(hero.bot.cards)
-            h_r_top = roy_top(hero.top.cards)
-            h_r_mid = roy_mid(hero.mid.cards)
-            h_r_bot = roy_bot(hero.bot.cards)
-            hero_roy = h_r_top + h_r_mid + h_r_bot
-        else:
-            hero_roy = 0
+        # --- ヒーローがファウルしたら即大きなマイナス ---
+        if hero_foul:
+            # 相手がどうであれ「自分のファウルは超痛い」
+            return -20.0 * n_opp
+
+        # ここから先はヒーローがノンファウルのときだけ
+        h_top = eval_3(hero.top.cards)
+        h_mid = eval_5(hero.mid.cards)
+        h_bot = eval_5(hero.bot.cards)
+        h_r_top = roy_top(hero.top.cards)
+        h_r_mid = roy_mid(hero.mid.cards)
+        h_r_bot = roy_bot(hero.bot.cards)
+        hero_roy = h_r_top + h_r_mid + h_r_bot
 
         total_reward = 0.0
 
         for idx, opp in enumerate(self.players):
             if idx == self.hero_idx:
                 continue
+
             opp_foul = opp.foul
 
-            if hero_foul and opp_foul:
-                # 両方ファウル：0点
-                continue
-            if hero_foul and not opp_foul:
-                # ヒーローだけファウル
-                total_reward -= 6.0
-                continue
-            if not hero_foul and opp_foul:
-                # 相手だけファウル
+            if opp_foul:
+                # 相手だけファウル → 固定で +6
                 total_reward += 6.0
                 continue
 
@@ -494,29 +491,24 @@ class OFCMultiEnv:
             o_mid = eval_5(opp.mid.cards)
             o_bot = eval_5(opp.bot.cards)
 
-            # ライン比較: 勝ち +1, 負け -1
-            def line_score(a3v5, b3v5, three=False):
-                if three:
-                    wa, ta = a3v5
-                    wb, tb = b3v5
-                    if wa != wb:
-                        return 1 if wa > wb else -1
-                    return 1 if ta > tb else (-1 if ta < tb else 0)
-                else:
-                    wa, ta = a3v5
-                    wb, tb = b3v5
-                    if wa != wb:
-                        return 1 if wa > wb else -1
-                    return 1 if ta > tb else (-1 if ta < tb else 0)
+            def line_score(a, b):
+                wa, ta = a
+                wb, tb = b
+                if wa != wb:
+                    return 1 if wa > wb else -1
+                return 1 if ta > tb else (-1 if ta < tb else 0)
 
             score = 0
-            score += line_score(h_top, o_top, three=True)
-            score += line_score(h_mid, o_mid, three=False)
-            score += line_score(h_bot, o_bot, three=False)
+            score += line_score(h_top, o_top)
+            score += line_score(h_mid, o_mid)
+            score += line_score(h_bot, o_bot)
 
             o_roy = roy_top(opp.top.cards) + roy_mid(opp.mid.cards) + roy_bot(opp.bot.cards)
             score += (hero_roy - o_roy)
 
             total_reward += float(score)
+
+        # ノンファウルで完走しただけでちょいボーナス
+        total_reward += 2.0 * n_opp
 
         return total_reward
