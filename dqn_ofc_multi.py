@@ -318,8 +318,59 @@ def train(
     print("saved:", save_path)
 
 # =====================
-# テスト（1エピソード）
+# 評価/テスト
 # =====================
+def evaluate(model_path="./ckpt/ofc_qnet_multi.pt",
+             n_players=2, hero_idx=0, seed=None, episodes=1000):
+    env = OFCMultiEnv(n_players=n_players, hero_idx=hero_idx, seed=seed)
+    model = QNet().to(DEVICE)
+    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    model.eval()
+
+    foul_cnt = 0
+    ret_sum = 0.0
+    legal_ret_sum = 0.0
+    legal_cnt = 0
+
+    for ep in range(episodes):
+        s = env.reset()
+        done = False
+        total_r = 0.0
+        while not done:
+            s_vec = encode_state(s)
+            acts = env.legal_actions()
+            if not acts:
+                break
+            qs = []
+            for a in acts:
+                a_vec = encode_action(s, a)
+                sa_np = np.concatenate([s_vec.astype(np.float32),
+                                        a_vec.astype(np.float32)], axis=0)
+                sa = torch.tensor(sa_np, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+                with torch.no_grad():
+                    qv = model(sa).item()
+                qs.append(qv)
+            best_idx = int(np.argmax(qs))
+            a = acts[best_idx]
+            s, r, done, _ = env.step(a)
+            total_r += r
+
+        hero = s.players[s.hero_idx]
+        ret_sum += total_r
+        if hero.foul:
+            foul_cnt += 1
+        else:
+            legal_cnt += 1
+            legal_ret_sum += total_r
+
+    print(f"[EVAL] episodes = {episodes}")
+    print(f"[EVAL] foul rate         = {foul_cnt/episodes:.3f}")
+    print(f"[EVAL] avg return (all)  = {ret_sum/episodes:.3f}")
+    if legal_cnt > 0:
+        print(f"[EVAL] avg return (legal only) = {legal_ret_sum/legal_cnt:.3f}")
+    else:
+        print("[EVAL] no legal hands 😇")
+
 def run_test(model_path="./ckpt/ofc_qnet_multi.pt", n_players=2, hero_idx=0, seed=None):
     env = OFCMultiEnv(n_players=n_players, hero_idx=hero_idx, seed=seed)
     model = QNet().to(DEVICE)
@@ -366,6 +417,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--train", action="store_true", help="学習モードで実行")
     parser.add_argument("--test", action="store_true", help="テスト（1エピソード）を実行")
+    parser.add_argument("--eval", type=int, default=0, help="評価を episodes 回実行")
     parser.add_argument("--episodes", type=int, default=20000)
     parser.add_argument("--n_players", type=int, default=2, help="プレイヤー人数(2〜3)")
     parser.add_argument("--hero_idx", type=int, default=0, help="学習対象プレイヤーのindex")
@@ -375,7 +427,15 @@ if __name__ == "__main__":
 
     os.makedirs("./ckpt", exist_ok=True)
 
-    if args.test:
+    if args.eval > 0:
+        evaluate(
+            model_path=args.model,
+            n_players=args.n_players,
+            hero_idx=args.hero_idx,
+            seed=args.seed,
+            episodes=args.eval,
+        )
+    elif args.test:
         run_test(
             model_path=args.model,
             n_players=args.n_players,
