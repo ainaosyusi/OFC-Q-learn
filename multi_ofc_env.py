@@ -222,10 +222,15 @@ class OFCMultiEnv:
         self.hand: List[Card] = []
 
     def _deal_init(self):
-        self.hand = [self.deck.pop() for _ in range(5)]
+        need = min(5, 13)
+        self.hand = [self.deck.pop() for _ in range(need)]
 
     def _deal_next(self):
-        self.hand = [self.deck.pop() for _ in range(3)]
+        # 以降は 3 枚ずつ（残りスロットが足りない場合は不足分のみ）
+        hero = self.players[self.hero_idx]
+        remain = 13 - (len(hero.top) + len(hero.mid) + len(hero.bot))
+        need = max(0, min(3, remain))
+        self.hand = [self.deck.pop() for _ in range(need)] if need > 0 else []
 
     def reset(self) -> MultiOFCState:
         self.players = [PlayerBoard() for _ in range(self.n_players)]
@@ -271,14 +276,17 @@ class OFCMultiEnv:
         reward = 0.0
         info: Dict = {}
 
-        if self.turn == 4:
+        hero_cards = len(hero.top) + len(hero.mid) + len(hero.bot)
+        if hero_cards >= 13:
             done = True
             reward = self._compute_hero_reward()
             info["hero_foul"] = self.players[self.hero_idx].foul
             return self._get_state(), reward, done, info
 
-        self.turn += 1
-        self._deal_next()
+        if not self.hand:
+            self.turn += 1
+            self._deal_next()
+
         return self._get_state(), reward, done, info
 
     def _compute_hero_reward(self) -> float:
