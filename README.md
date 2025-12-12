@@ -31,3 +31,20 @@ python dqn_ofc_multi.py --train --episodes 50000 --n_players 2 --hero_idx 0 --se
 
 # 実験B：3人戦
 python dqn_ofc_multi.py --train --episodes 50000 --n_players 3 --hero_idx 0 --seed 11
+
+
+------
+# OFC Human Demo → BC → RL 手順（最短）
+
+## 前提
+- repo: `~/OFC-Q-learn/OFC-Q-learn`
+- venv: `source ~/ofc_env/bin/activate`
+- 既存: `dqn_ofc_multi.py`, `multi_ofc_env.py` が動く
+
+---
+
+## 0. 準備
+```bash
+cd ~/OFC-Q-learn/OFC-Q-learn
+source ~/ofc_env/bin/activate
+mkdir -p demos ckpt logs

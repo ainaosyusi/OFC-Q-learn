@@ -1,452 +1,373 @@
-# dqn_ofc_multi.py
+from __future__ import annotations
+
+import argparse
 import math
+import os
 import random
 from collections import deque, namedtuple
-from typing import List
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from multi_ofc_env import (
-    OFCMultiEnv, MultiOFCState, PlayerBoard,
-    RANKS, SUITS, eval_3, eval_5, catname_3, catname_5
-)
+from multi_ofc_env import OFCMultiEnv, MultiOFCState, PlayerBoard, RANKS, SUITS
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # =====================
-# 状態・行動エンコード
+# カード/行動 エンコード
 # =====================
-N_CARDS = 52
-CARD2IDX = {r + s: i for i, (r, s) in enumerate((r, s) for r in RANKS for s in SUITS)}
 
-# ロケーションカテゴリ:
-# 0: unknown
-# hero: 1..5 (top, mid, bot, dead, incoming)
-# opp1: 6..10
-# opp2: 11..15
-LOC_DIM = 16
+# Joker を 1種類 "X" として扱う（env 側が "X" を使う前提）
+JOKER = "X"
+
+RANKS52 = RANKS
+SUITS52 = SUITS
+DECK52: List[str] = [r + s for r in RANKS52 for s in SUITS52]
+
+CARD_LIST: List[str] = DECK52 + [JOKER]
+N_CARDS = len(CARD_LIST)  # 53
+
+CARD2IDX: Dict[str, int] = {c: i for i, c in enumerate(CARD_LIST)}
+
+def card_to_idx(c: str) -> int:
+    # 万一未知が来たら落とす（黙って無視すると学習が壊れる）
+    if c not in CARD2IDX:
+        raise KeyError(f"Unknown card: {c}")
+    return CARD2IDX[c]
+
+# turn0 の行動: 5枚に対して T/M/B を割り当て（ただし Top は最大3枚）
+ACTIONS_T0: List[List[str]] = []
+for a in ["T", "M", "B"]:
+    for b in ["T", "M", "B"]:
+        for c in ["T", "M", "B"]:
+            for d in ["T", "M", "B"]:
+                for e in ["T", "M", "B"]:
+                    places = [a, b, c, d, e]
+                    if places.count("T") <= 3:
+                        ACTIONS_T0.append(places)
+
+# turn>0 の行動: (discard_idx, p1, p2) で p1/p2 ∈ {T,M,B}
+ACTIONS_TN: List[Tuple[int, str, str]] = []
+for di in [0, 1, 2]:
+    for p1 in ["T", "M", "B"]:
+        for p2 in ["T", "M", "B"]:
+            ACTIONS_TN.append((di, p1, p2))
+
+N_ACT_T0 = len(ACTIONS_T0)     # 232
+N_ACT_TN = len(ACTIONS_TN)     # 27
+N_ACTIONS = N_ACT_T0 + N_ACT_TN  # 259
+
+
+# =====================
+# 状態エンコード
+# =====================
 
 def encode_state(s: MultiOFCState) -> np.ndarray:
     """
-    52枚 × 16ロケーション + turn one-hot(5) + hero-pos one-hot(3)
+    env の MultiOFCState 前提:
+      - s.players: List[PlayerBoard]
+      - s.hero_idx: int
+      - s.current_cards: List[str]  (turn0=5枚, それ以外=3枚)
+      - s.turn: int  (0..4)
     """
-    loc = np.zeros((N_CARDS, LOC_DIM), dtype=np.float32)
-    loc[:, 0] = 1.0  # unknown に初期化
-
-    hero_idx = s.hero_idx
     n_players = len(s.players)
 
-    # hero のカテゴリベース
-    HERO_BASE = 1
-    OPP1_BASE = 6
-    OPP2_BASE = 11
+    # 1プレイヤあたり固定 13スロット (Top3 + Mid5 + Bot5)
+    SLOTS_PER_PLAYER = 13
+    MAX_CUR = 5  # current_cards は最大 5 を確保
 
-    def place_cards(cards, base, offset):
-        for c in cards:
-            ci = CARD2IDX[c]
-            loc[ci, :] = 0.0
-            loc[ci, base + offset] = 1.0
+    # 追加のスカラー特徴
+    EXTRA = 2  # (turn/4, is_turn0)
 
-    # hero
-    hero = s.players[hero_idx]
-    place_cards(hero.top.cards, HERO_BASE, 0)
-    place_cards(hero.mid.cards, HERO_BASE, 1)
-    place_cards(hero.bot.cards, HERO_BASE, 2)
-    place_cards(hero.dead,      HERO_BASE, 3)
-    place_cards(hero.incoming,  HERO_BASE, 4)
+    dim = n_players * SLOTS_PER_PLAYER * N_CARDS + MAX_CUR * N_CARDS + EXTRA
+    vec = np.zeros(dim, dtype=np.float32)
 
-    # opponent mapping
-    opp_slots = []
-    for idx in range(n_players):
-        if idx == hero_idx:
-            continue
-        opp_slots.append(idx)
-    # 最大2人分だけ扱う
-    while len(opp_slots) < 2:
-        opp_slots.append(None)
+    def put(base: int, card: str):
+        vec[base + card_to_idx(card)] = 1.0
 
-    # opp1
-    if opp_slots[0] is not None:
-        p = s.players[opp_slots[0]]
-        place_cards(p.top.cards, OPP1_BASE, 0)
-        place_cards(p.mid.cards, OPP1_BASE, 1)
-        place_cards(p.bot.cards, OPP1_BASE, 2)
-        place_cards(p.dead,      OPP1_BASE, 3)
-        place_cards(p.incoming,  OPP1_BASE, 4)
+    # players 部分
+    for pi, pb in enumerate(s.players):
+        # スロット順: top0..2, mid0..4, bot0..4
+        slot_cards: List[str] = []
+        slot_cards += list(pb.top)[:3]
+        slot_cards += list(pb.mid)[:5]
+        slot_cards += list(pb.bot)[:5]
 
-    # opp2
-    if opp_slots[1] is not None:
-        p = s.players[opp_slots[1]]
-        place_cards(p.top.cards, OPP2_BASE, 0)
-        place_cards(p.mid.cards, OPP2_BASE, 1)
-        place_cards(p.bot.cards, OPP2_BASE, 2)
-        place_cards(p.dead,      OPP2_BASE, 3)
-        place_cards(p.incoming,  OPP2_BASE, 4)
+        # 足りない分は空スロット扱い（0のまま）
+        for si, card in enumerate(slot_cards):
+            base = (pi * SLOTS_PER_PLAYER + si) * N_CARDS
+            put(base, card)
 
-    loc_flat = loc.reshape(-1)  # 52 * 16 = 832
+    # current_cards 部分（最大5枠）
+    offset_cur = n_players * SLOTS_PER_PLAYER * N_CARDS
+    for i, card in enumerate(s.current_cards[:MAX_CUR]):
+        base = offset_cur + i * N_CARDS
+        put(base, card)
 
-    # turn one-hot (0..4)
-    turn_oh = np.zeros(5, dtype=np.float32)
-    t = max(0, min(4, s.turn))
-    turn_oh[t] = 1.0
+    # extra
+    offset_extra = offset_cur + MAX_CUR * N_CARDS
+    vec[offset_extra + 0] = float(s.turn) / 4.0
+    vec[offset_extra + 1] = 1.0 if s.turn == 0 else 0.0
 
-    # hero position one-hot (最大3人想定)
-    pos_oh = np.zeros(3, dtype=np.float32)
-    pos_oh[min(s.hero_idx, 2)] = 1.0
+    return vec
 
-    return np.concatenate([loc_flat, turn_oh, pos_oh], axis=0)
 
-# 行動エンコード: hero のボードだけを見れば良い
-def encode_action(s: MultiOFCState, action) -> np.ndarray:
-    """
-    初手5枚:
-        - hero.incoming は 5枚
-        - action は ['T','M','B',...] 長さ5
-        → 1枚ごとに (カードone-hot 52 + 置き先one-hot3) = 55 を連結 → 275
-    pineapple:
-        - hero.incoming は 3枚
-        - action は (discard_idx, p1, p2)
-        → discard idx one-hot3 + 2枚分の(52+3)=55×2 = 113
-        → 275まで0埋め
-    """
-    hero = s.players[s.hero_idx]
-    if s.turn == 0:
-        inc = hero.incoming
-        assert len(inc) == 5
-        feat = []
-        for c, dst in zip(inc, action):
-            card_oh = np.zeros(N_CARDS, dtype=np.float32)
-            card_oh[CARD2IDX[c]] = 1.0
-            dst_oh = np.zeros(3, dtype=np.float32)
-            dst_oh["TMB".index(dst)] = 1.0
-            feat.append(np.concatenate([card_oh, dst_oh], axis=0))  # 55
-        return np.concatenate(feat, axis=0)  # 275
+def legal_action_indices(env: OFCMultiEnv) -> List[int]:
+    """env.legal_actions() の戻り（turn0はList[str]、それ以外はTuple）を固定indexへ変換"""
+    acts = env.legal_actions()
+    if env.turn == 0:
+        # acts: List[List[str]]
+        # ACTIONS_T0 の中から一致するものを index にする
+        mp = {tuple(a): i for i, a in enumerate(ACTIONS_T0)}
+        out = []
+        for a in acts:
+            out.append(mp[tuple(a)])
+        return out
     else:
-        inc = hero.incoming
-        assert len(inc) == 3
-        d, p1, p2 = action
-        d_oh = np.zeros(3, dtype=np.float32)
-        d_oh[d] = 1.0
-        keep = [inc[i] for i in range(3) if i != d]
+        # acts: List[(d,p1,p2)]
+        mp = {a: i for i, a in enumerate(ACTIONS_TN)}
+        out = []
+        for a in acts:
+            out.append(N_ACT_T0 + mp[a])
+        return out
 
-        def one(c, dst):
-            card_oh = np.zeros(N_CARDS, dtype=np.float32)
-            card_oh[CARD2IDX[c]] = 1.0
-            dst_oh = np.zeros(3, dtype=np.float32)
-            dst_oh["TMB".index(dst)] = 1.0
-            return np.concatenate([card_oh, dst_oh], axis=0)
 
-        a1 = one(keep[0], p1)
-        a2 = one(keep[1], p2)
-        vec = np.concatenate([d_oh, a1, a2], axis=0)  # 113
-        pad = np.zeros(275 - 113, dtype=np.float32)
-        return np.concatenate([vec, pad], axis=0)
+def decode_action(env: OFCMultiEnv, aidx: int):
+    """固定index -> env に渡す action object"""
+    if env.turn == 0:
+        return ACTIONS_T0[aidx]
+    else:
+        return ACTIONS_TN[aidx - N_ACT_T0]
 
-STATE_DIM = 832 + 5 + 3  # 840
-ACT_DIM   = 275
-SA_DIM    = STATE_DIM + ACT_DIM
 
 # =====================
-# Qネットワーク Q(s,a)
+# DQN
 # =====================
-class QNet(nn.Module):
-    def __init__(self, in_dim=SA_DIM, hidden=(512, 512, 256)):
-        super().__init__()
-        layers = []
-        last = in_dim
-        for h in hidden:
-            layers += [nn.Linear(last, h), nn.ReLU()]
-            last = h
-        layers += [nn.Linear(last, 1)]
-        self.net = nn.Sequential(*layers)
 
-    def forward(self, sa):
-        return self.net(sa).squeeze(-1)  # (B,)
+Transition = namedtuple("Transition", ("s", "a", "r", "ns", "done"))
 
-# =====================
-# リプレイバッファ
-# =====================
-Transition = namedtuple("Transition", ("s_vec", "a_vec", "r", "s2_vec", "done"))
+class ReplayBuffer:
+    def __init__(self, capacity: int):
+        self.buf = deque(maxlen=capacity)
 
-class Replay:
-    def __init__(self, cap=200_000):
-        self.buf = deque(maxlen=cap)
-    def __len__(self):
-        return len(self.buf)
     def push(self, *args):
         self.buf.append(Transition(*args))
-    def sample(self, n):
-        idx = np.random.choice(len(self.buf), size=n, replace=False)
+
+    def sample(self, batch_size: int):
+        idx = np.random.choice(len(self.buf), batch_size, replace=False)
         return [self.buf[i] for i in idx]
 
-# =====================
-# ε-greedy 行動選択
-# =====================
-def select_action(env: OFCMultiEnv, qnet: QNet, s: MultiOFCState, epsilon: float):
-    s_vec = encode_state(s)
-    acts = env.legal_actions()
-    if not acts:
-        return None, s_vec, None
+    def __len__(self):
+        return len(self.buf)
 
-    # ε-greedy
-    if random.random() < epsilon:
-        a = random.choice(acts)
-        a_vec = encode_action(s, a)
-        return a, s_vec, a_vec
+class QNet(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, 1024),
+            nn.ReLU(),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.Linear(512, out_dim),
+        )
 
-    # greedy
-    with torch.no_grad():
-        qs = []
-        for a in acts:
-            a_vec = encode_action(s, a)
-            sa_np = np.concatenate([s_vec.astype(np.float32), a_vec.astype(np.float32)], axis=0)
-            sa = torch.tensor(sa_np, dtype=torch.float32, device=DEVICE).unsqueeze(0)
-            q = qnet(sa).item()
-            qs.append(q)
-        best_idx = int(np.argmax(qs))
-        a = acts[best_idx]
-        a_vec = encode_action(s, a)
-        return a, s_vec, a_vec
+    def forward(self, x):
+        return self.net(x)
 
-# =====================
-# エピソード実行
-# =====================
-def play_episode(env: OFCMultiEnv, qnet: QNet, epsilon: float, gamma=0.99):
-    s = env.reset()
-    done = False
-    total_r = 0.0
-    traj = []
+@torch.no_grad()
+def select_action(qnet: QNet, svec: np.ndarray, legal_idxs: List[int], eps: float) -> int:
+    if random.random() < eps:
+        return random.choice(legal_idxs)
 
-    while not done:
-        a, s_vec, a_vec = select_action(env, qnet, s, epsilon)
-        if a is None:
-            # 行動無しで終局してしまう rare case
-            break
-        s2, r, done, _ = env.step(a)
-        s2_vec = encode_state(s2)
-        total_r += r
-        traj.append((s_vec, a_vec, r, s2_vec, float(done)))
-        s = s2
+    x = torch.tensor(svec, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+    q = qnet(x).squeeze(0).detach().cpu().numpy()
 
-    # 将来割引は学習側で扱うので、ここでは単純にステップ毎報酬として記録
-    return total_r, traj
+    # illegal を -inf に
+    mask = np.full_like(q, -1e9, dtype=np.float32)
+    mask[legal_idxs] = q[legal_idxs]
+    return int(mask.argmax())
 
-# =====================
-# 学習ループ
-# =====================
 def train(
-    num_episodes=20000,
-    n_players=2,
-    hero_idx=0,
-    start_learning=1024,
-    batch_size=256,
-    gamma=0.995,
-    lr=2e-4,
-    target_sync=2000,
-    epsilon_start=0.7,
-    epsilon_end=0.05,
-    epsilon_decay=30000,
-    seed=11,
-    save_path="./ckpt/ofc_qnet_multi.pt",
+    episodes: int,
+    n_players: int,
+    hero_idx: int,
+    seed: int,
+    n_jokers: int,
+    model_path: str,
+    log_interval: int = 200,
+    save_interval: int = 5000,
 ):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    env = OFCMultiEnv(n_players=n_players, hero_idx=hero_idx, seed=seed)
-    qnet = QNet().to(DEVICE)
-    tgt  = QNet().to(DEVICE)
+    env = OFCMultiEnv(n_players=n_players, hero_idx=hero_idx, seed=seed, n_jokers=n_jokers)
+
+    # state dim を一度作って決める
+    s0 = env.reset()
+    in_dim = encode_state(s0).shape[0]
+
+    qnet = QNet(in_dim, N_ACTIONS).to(DEVICE)
+    tgt = QNet(in_dim, N_ACTIONS).to(DEVICE)
     tgt.load_state_dict(qnet.state_dict())
 
-    opt = optim.Adam(qnet.parameters(), lr=lr)
-    buf = Replay(cap=300_000)
+    opt = optim.Adam(qnet.parameters(), lr=1e-4)
+    buf = ReplayBuffer(capacity=200_000)
 
-    step = 0
-    log_every = 200
+    gamma = 0.99
+    batch_size = 256
+    warmup = 2000
+    target_sync = 2000
 
-    for ep in range(1, num_episodes + 1):
-        epsilon = epsilon_end + (epsilon_start - epsilon_end) * math.exp(-(step)/epsilon_decay)
-        ret, traj = play_episode(env, qnet, epsilon, gamma=gamma)
+    eps_start = 1.0
+    eps_end = 0.05
+    eps_decay = 200_000  # episodes で線形減衰
 
-        # バッファに追加
-        for (s_vec, a_vec, _r_step, s2_vec, done) in traj:
-            buf.push(s_vec, a_vec, ret, s2_vec, done)
+    def eps_by_ep(ep: int) -> float:
+        if ep >= eps_decay:
+            return eps_end
+        return eps_start + (eps_end - eps_start) * (ep / eps_decay)
 
-        # 学習ステップ
-        if len(buf) >= start_learning:
-            batch = buf.sample(batch_size)
-            s_batch  = torch.tensor(np.stack([b.s_vec  for b in batch]), dtype=torch.float32, device=DEVICE)
-            a_batch  = torch.tensor(np.stack([b.a_vec  for b in batch]), dtype=torch.float32, device=DEVICE)
-            r_batch  = torch.tensor(np.array([b.r      for b in batch], dtype=np.float32), device=DEVICE)
-            s2_batch = torch.tensor(np.stack([b.s2_vec for b in batch]), dtype=torch.float32, device=DEVICE)
-            d_batch  = torch.tensor(np.array([b.done   for b in batch], dtype=np.float32), device=DEVICE)
+    step_count = 0
 
-            sa = torch.cat([s_batch, a_batch], dim=1)
-            q  = qnet(sa)  # (B,)
-
-            with torch.no_grad():
-                # 次状態での最大 Q を target ネットで計算
-                q_next = []
-                for i in range(batch_size):
-                    s2_vec_np = s2_batch[i].cpu().numpy()
-                    # s2 の「元状態オブジェクト」は持っていないが、行動のmax計算は難しいので
-                    # ここでは「次状態のQを 0」として近似 (terminal のみ / 低頻度報酬ならそこそこ動く)
-                    # → 本格的には rehydrate_state + legal_actions で DoubleDQN する
-                    q_next.append(0.0)
-                q_next = torch.tensor(q_next, dtype=torch.float32, device=DEVICE)
-
-                y = r_batch + (1.0 - d_batch) * gamma * q_next
-
-            loss = nn.SmoothL1Loss()(q, y)
-            opt.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(qnet.parameters(), 1.0)
-            opt.step()
-
-            if step % target_sync == 0:
-                tgt.load_state_dict(qnet.state_dict())
-
-        step += 1
-
-        if ep % log_every == 0:
-            print(f"[EP {ep:5d}] return={ret:+.3f} buf={len(buf)} eps={epsilon:.3f}")
-
-    torch.save(qnet.state_dict(), save_path)
-    print("saved:", save_path)
-
-# =====================
-# 評価/テスト
-# =====================
-def evaluate(model_path="./ckpt/ofc_qnet_multi.pt",
-             n_players=2, hero_idx=0, seed=None, episodes=1000):
-    env = OFCMultiEnv(n_players=n_players, hero_idx=hero_idx, seed=seed)
-    model = QNet().to(DEVICE)
-    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
-    model.eval()
-
-    foul_cnt = 0
-    ret_sum = 0.0
-    legal_ret_sum = 0.0
-    legal_cnt = 0
-
-    for ep in range(episodes):
+    for ep in range(1, episodes + 1):
         s = env.reset()
         done = False
-        total_r = 0.0
+        ep_ret = 0.0
+        hero_foul = False
+
         while not done:
-            s_vec = encode_state(s)
-            acts = env.legal_actions()
-            if not acts:
-                break
-            qs = []
-            for a in acts:
-                a_vec = encode_action(s, a)
-                sa_np = np.concatenate([s_vec.astype(np.float32),
-                                        a_vec.astype(np.float32)], axis=0)
-                sa = torch.tensor(sa_np, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+            svec = encode_state(s)
+            legal_idxs = legal_action_indices(env)
+
+            eps = eps_by_ep(ep)
+            aidx = select_action(qnet, svec, legal_idxs, eps)
+            action = decode_action(env, aidx)
+
+            ns, r, done, info = env.step(action)
+            ep_ret += r
+            hero_foul = bool(info.get("hero_foul", False))
+
+            buf.push(svec, aidx, r, encode_state(ns), done)
+            s = ns
+
+            # learn
+            if len(buf) >= max(warmup, batch_size):
+                batch = buf.sample(batch_size)
+                bs = torch.tensor(np.stack([t.s for t in batch]), dtype=torch.float32, device=DEVICE)
+                ba = torch.tensor([t.a for t in batch], dtype=torch.int64, device=DEVICE).unsqueeze(1)
+                br = torch.tensor([t.r for t in batch], dtype=torch.float32, device=DEVICE).unsqueeze(1)
+                bns = torch.tensor(np.stack([t.ns for t in batch]), dtype=torch.float32, device=DEVICE)
+                bd = torch.tensor([t.done for t in batch], dtype=torch.float32, device=DEVICE).unsqueeze(1)
+
+                q = qnet(bs).gather(1, ba)
+
                 with torch.no_grad():
-                    qv = model(sa).item()
-                qs.append(qv)
-            best_idx = int(np.argmax(qs))
-            a = acts[best_idx]
-            s, r, done, _ = env.step(a)
-            total_r += r
+                    nq = tgt(bns).max(dim=1, keepdim=True)[0]
+                    y = br + (1.0 - bd) * gamma * nq
 
-        hero = s.players[s.hero_idx]
-        ret_sum += total_r
-        if hero.foul:
-            foul_cnt += 1
-        else:
-            legal_cnt += 1
-            legal_ret_sum += total_r
+                loss = nn.functional.smooth_l1_loss(q, y)
 
-    print(f"[EVAL] episodes = {episodes}")
-    print(f"[EVAL] foul rate         = {foul_cnt/episodes:.3f}")
-    print(f"[EVAL] avg return (all)  = {ret_sum/episodes:.3f}")
-    if legal_cnt > 0:
-        print(f"[EVAL] avg return (legal only) = {legal_ret_sum/legal_cnt:.3f}")
-    else:
-        print("[EVAL] no legal hands 😇")
+                opt.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(qnet.parameters(), 5.0)
+                opt.step()
 
-def run_test(model_path="./ckpt/ofc_qnet_multi.pt", n_players=2, hero_idx=0, seed=None):
-    env = OFCMultiEnv(n_players=n_players, hero_idx=hero_idx, seed=seed)
-    model = QNet().to(DEVICE)
-    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
-    model.eval()
+                step_count += 1
+                if step_count % target_sync == 0:
+                    tgt.load_state_dict(qnet.state_dict())
 
-    print("=== 試行開始（multi） ===")
-    s = env.reset()
-    done = False
-    total_r = 0.0
+        if ep % log_interval == 0:
+            print(f"[TRAIN] ep={ep} eps={eps_by_ep(ep):.3f} return={ep_ret:.3f} foul={hero_foul} buf={len(buf)}")
 
-    while not done:
-        s_vec = encode_state(s)
-        acts = env.legal_actions()
-        if not acts:
-            break
-        qs = []
-        for a in acts:
-            a_vec = encode_action(s, a)
-            sa_np = np.concatenate([s_vec.astype(np.float32), a_vec.astype(np.float32)], axis=0)
-            sa = torch.tensor(sa_np, dtype=torch.float32, device=DEVICE).unsqueeze(0)
-            with torch.no_grad():
-                qv = model(sa).item()
-            qs.append(qv)
-        best_idx = int(np.argmax(qs))
-        a = acts[best_idx]
-        s, r, done, _ = env.step(a)
-        total_r += r
+        if ep % save_interval == 0:
+            os.makedirs(os.path.dirname(model_path), exist_ok=True)
+            torch.save(qnet.state_dict(), model_path)
+            print(f"[SAVE] {model_path}")
 
-    hero = s.players[s.hero_idx]
-    print("報酬:", total_r, "ファウル:", hero.foul)
-    print("Top役:", catname_3(*eval_3(hero.top.cards)))
-    print("Mid役:", catname_5(*eval_5(hero.mid.cards)))
-    print("Bot役:", catname_5(*eval_5(hero.bot.cards)))
-    print("Top:", hero.top.cards)
-    print("Mid:", hero.mid.cards)
-    print("Bot:", hero.bot.cards)
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+    torch.save(qnet.state_dict(), model_path)
+    print(f"[DONE] saved: {model_path}")
 
-# =====================
-# CLI
-# =====================
-if __name__ == "__main__":
-    import argparse, os
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--train", action="store_true", help="学習モードで実行")
-    parser.add_argument("--test", action="store_true", help="テスト（1エピソード）を実行")
-    parser.add_argument("--eval", type=int, default=0, help="評価を episodes 回実行")
-    parser.add_argument("--episodes", type=int, default=20000)
-    parser.add_argument("--n_players", type=int, default=2, help="プレイヤー人数(2〜3)")
-    parser.add_argument("--hero_idx", type=int, default=0, help="学習対象プレイヤーのindex")
-    parser.add_argument("--seed", type=int, default=11)
-    parser.add_argument("--model", type=str, default="./ckpt/ofc_qnet_multi.pt")
-    args = parser.parse_args()
+@torch.no_grad()
+def evaluate(
+    model_path: str,
+    n_players: int,
+    hero_idx: int,
+    seed: int,
+    n_jokers: int,
+    episodes: int,
+):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
-    os.makedirs("./ckpt", exist_ok=True)
+    env = OFCMultiEnv(n_players=n_players, hero_idx=hero_idx, seed=seed, n_jokers=n_jokers)
 
-    if args.eval > 0:
+    s0 = env.reset()
+    in_dim = encode_state(s0).shape[0]
+
+    qnet = QNet(in_dim, N_ACTIONS).to(DEVICE)
+    qnet.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    qnet.eval()
+
+    total = 0.0
+    foul_cnt = 0
+
+    for _ in range(episodes):
+        s = env.reset()
+        done = False
+        ep_ret = 0.0
+        hero_foul = False
+
+        while not done:
+            svec = encode_state(s)
+            legal_idxs = legal_action_indices(env)
+            aidx = select_action(qnet, svec, legal_idxs, eps=0.0)
+            action = decode_action(env, aidx)
+            s, r, done, info = env.step(action)
+            ep_ret += r
+            hero_foul = bool(info.get("hero_foul", False))
+
+        total += ep_ret
+        foul_cnt += 1 if hero_foul else 0
+
+    print(f"[EVAL] episodes={episodes} foul_rate={foul_cnt/episodes:.3f} avg_return={total/episodes:.3f}")
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--train", action="store_true")
+    ap.add_argument("--episodes", type=int, default=2000)
+    ap.add_argument("--eval", type=int, default=0, help="number of eval episodes")
+    ap.add_argument("--n_players", type=int, default=3)
+    ap.add_argument("--hero_idx", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--n_jokers", type=int, default=0)
+    ap.add_argument("--model", type=str, default="./ckpt/model.pt")
+    args = ap.parse_args()
+
+    if args.train:
+        train(
+            episodes=args.episodes,
+            n_players=args.n_players,
+            hero_idx=args.hero_idx,
+            seed=args.seed,
+            n_jokers=args.n_jokers,
+            model_path=args.model,
+        )
+
+    if args.eval and args.eval > 0:
         evaluate(
             model_path=args.model,
             n_players=args.n_players,
             hero_idx=args.hero_idx,
             seed=args.seed,
+            n_jokers=args.n_jokers,
             episodes=args.eval,
         )
-    elif args.test:
-        run_test(
-            model_path=args.model,
-            n_players=args.n_players,
-            hero_idx=args.hero_idx,
-            seed=args.seed,
-        )
-    else:
-        train(
-            num_episodes=args.episodes,
-            n_players=args.n_players,
-            hero_idx=args.hero_idx,
-            seed=args.seed,
-            save_path=args.model,
-        )
+
+if __name__ == "__main__":
+    main()
