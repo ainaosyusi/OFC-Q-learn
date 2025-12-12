@@ -38,27 +38,15 @@ def card_to_idx(c: str) -> int:
         raise KeyError(f"Unknown card: {c}")
     return CARD2IDX[c]
 
-# turn0 の行動: 5枚に対して T/M/B を割り当て（ただし Top は最大3枚）
-ACTIONS_T0: List[List[str]] = []
-for a in ["T", "M", "B"]:
-    for b in ["T", "M", "B"]:
-        for c in ["T", "M", "B"]:
-            for d in ["T", "M", "B"]:
-                for e in ["T", "M", "B"]:
-                    places = [a, b, c, d, e]
-                    if places.count("T") <= 3:
-                        ACTIONS_T0.append(places)
+# (card_idx, row) の全組み合わせ（初手は最大5枚、それ以降は3枚なので idx=0..4 を確保）
+ACTIONS: List[Tuple[int, str]] = []
+for ci in range(5):
+    for row in ["T", "M", "B"]:
+        ACTIONS.append((ci, row))
 
-# turn>0 の行動: (discard_idx, p1, p2) で p1/p2 ∈ {T,M,B}
-ACTIONS_TN: List[Tuple[int, str, str]] = []
-for di in [0, 1, 2]:
-    for p1 in ["T", "M", "B"]:
-        for p2 in ["T", "M", "B"]:
-            ACTIONS_TN.append((di, p1, p2))
-
-N_ACT_T0 = len(ACTIONS_T0)     # 232
-N_ACT_TN = len(ACTIONS_TN)     # 27
-N_ACTIONS = N_ACT_T0 + N_ACT_TN  # 259
+# 既存モデルとの互換性のため出力次元は 259 のまま確保し、実際に使うのは先頭 15 個のみ
+N_REAL_ACTIONS = len(ACTIONS)  # 15
+N_ACTIONS = 259
 
 
 # =====================
@@ -68,12 +56,13 @@ N_ACTIONS = N_ACT_T0 + N_ACT_TN  # 259
 def encode_state(s: MultiOFCState) -> np.ndarray:
     """
     env の MultiOFCState 前提:
-      - s.players: List[PlayerBoard]
-      - s.hero_idx: int
-      - s.current_cards: List[str]  (turn0=5枚, それ以外=3枚)
       - s.turn: int  (0..4)
+      - s.hand: List[str]  (turn0=5枚, それ以降=3枚)
+      - s.hero: PlayerBoard
+      - s.opps: List[PlayerBoard]
     """
-    n_players = len(s.players)
+    players: List[PlayerBoard] = [s.hero] + list(s.opps)
+    n_players = len(players)
 
     # 1プレイヤあたり固定 13スロット (Top3 + Mid5 + Bot5)
     SLOTS_PER_PLAYER = 13
@@ -88,8 +77,8 @@ def encode_state(s: MultiOFCState) -> np.ndarray:
     def put(base: int, card: str):
         vec[base + card_to_idx(card)] = 1.0
 
-    # players 部分
-    for pi, pb in enumerate(s.players):
+    # players 部分（hero を先頭、その後に opps を列挙）
+    for pi, pb in enumerate(players):
         # スロット順: top0..2, mid0..4, bot0..4
         slot_cards: List[str] = []
         slot_cards += list(pb.top)[:3]
@@ -103,7 +92,7 @@ def encode_state(s: MultiOFCState) -> np.ndarray:
 
     # current_cards 部分（最大5枠）
     offset_cur = n_players * SLOTS_PER_PLAYER * N_CARDS
-    for i, card in enumerate(s.current_cards[:MAX_CUR]):
+    for i, card in enumerate(s.hand[:MAX_CUR]):
         base = offset_cur + i * N_CARDS
         put(base, card)
 
@@ -116,31 +105,23 @@ def encode_state(s: MultiOFCState) -> np.ndarray:
 
 
 def legal_action_indices(env: OFCMultiEnv) -> List[int]:
-    """env.legal_actions() の戻り（turn0はList[str]、それ以外はTuple）を固定indexへ変換"""
-    acts = env.legal_actions()
-    if env.turn == 0:
-        # acts: List[List[str]]
-        # ACTIONS_T0 の中から一致するものを index にする
-        mp = {tuple(a): i for i, a in enumerate(ACTIONS_T0)}
-        out = []
-        for a in acts:
-            out.append(mp[tuple(a)])
-        return out
-    else:
-        # acts: List[(d,p1,p2)]
-        mp = {a: i for i, a in enumerate(ACTIONS_TN)}
-        out = []
-        for a in acts:
-            out.append(N_ACT_T0 + mp[a])
-        return out
+    """env.available_actions() の戻り (idx,row) を固定 index へ変換"""
+    acts = env.available_actions()
+    mp = {a: i for i, a in enumerate(ACTIONS)}
+    out: List[int] = []
+    for a in acts:
+        if a in mp:
+            out.append(mp[a])
+    return out
 
 
 def decode_action(env: OFCMultiEnv, aidx: int):
     """固定index -> env に渡す action object"""
-    if env.turn == 0:
-        return ACTIONS_T0[aidx]
-    else:
-        return ACTIONS_TN[aidx - N_ACT_T0]
+    if aidx < N_REAL_ACTIONS:
+        return ACTIONS[aidx]
+    # ありえない場合は最初の合法行動を返す（マスクされている前提）
+    legal = env.available_actions()
+    return legal[0] if legal else (0, "T")
 
 
 # =====================
