@@ -182,6 +182,11 @@ class PlayerBoard:
         else: raise ValueError("row must be T/M/B")
 
     def evaluate_foul(self):
+        # 不完全な状態なら役判定できないので即フォール扱い
+        if len(self.top) != 3 or len(self.mid) != 5 or len(self.bot) != 5:
+            self.foul = True
+            return
+
         t_cat, t_tb = eval_3(self.top)
         m_cat, m_tb = eval_5(self.mid)
         b_cat, b_tb = eval_5(self.bot)
