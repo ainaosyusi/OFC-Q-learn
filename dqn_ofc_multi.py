@@ -11,7 +11,14 @@ from typing import Dict, List, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn as nn
 import torch.optim as optim
+try:
+    from tqdm import tqdm
+except ImportError:
+    # fallback
+    def tqdm(iterable, **kwargs):
+        return iterable
 
 from multi_ofc_env import OFCMultiEnv, MultiOFCState, PlayerBoard, RANKS, SUITS
 
@@ -207,8 +214,14 @@ def train(
 
     step_count = 0
 
-    for ep in range(1, episodes + 1):
+    # Recent stats
+    recent_rets = deque(maxlen=100)
+    recent_foul = deque(maxlen=100)
+    
+    pbar = tqdm(range(1, episodes + 1), desc="Training")
+    for ep in pbar:
         s = env.reset()
+        ep_trans = []
         done = False
         ep_ret = 0.0
         hero_foul = False
@@ -223,9 +236,45 @@ def train(
             ep_ret += r
             hero_foul = bool(info.get("hero_foul", False))
 
-            buf.push(s_vec, a_vec, r, copy.deepcopy(ns), done)
+            # Monte Carlo: store in temp buffer
+            ep_trans.append([s_vec, a_vec, r, copy.deepcopy(ns), done])
             s = ns
 
+        # End of episode: propagate total return
+        for t in ep_trans:
+            # t = [s_vec, a_vec, original_r, ns, done]
+            # Replace original_r with ep_ret
+            t[2] = ep_ret
+            buf.push(*t)
+
+        # Update stats
+        recent_rets.append(ep_ret)
+        recent_foul.append(1 if hero_foul else 0)
+        avg_ret = sum(recent_rets) / len(recent_rets) if recent_rets else 0.0
+        foul_rate = sum(recent_foul) / len(recent_foul) if recent_foul else 0.0
+        
+        # Update progress bar
+        if ep % 10 == 0:
+            pbar.set_postfix({
+                "ret": f"{avg_ret:.2f}",
+                "foul": f"{foul_rate:.2f}",
+                "eps": f"{eps:.3f}",
+                "buf": len(buf)
+            })
+
+        while False: # dummy loop to keep indentation of existing learning code if needed, 
+                     # but actually we want to run learning steps here.
+                     # However, the original code ran learning inside the while loop.
+                     # Since we now act first then learn? 
+                     # Wait, the original code ran learning at EVERY step.
+                     # With MC, we can still run learning at every step if we want, OR after episode.
+                     # Let's keep the frequency roughly same: run learning times equal to steps.
+            pass
+
+        # Run optimization steps equal to episode length (or just once per episode? Original was per step)
+        # Original: inside while loop. Now we are outside.
+        # Let's run it len(ep_trans) times to match frequency.
+        for _ in range(len(ep_trans)):
             # learn
             if len(buf) >= max(warmup, batch_size):
                 batch = buf.sample(batch_size)
@@ -275,7 +324,8 @@ def train(
                     tgt.load_state_dict(qnet.state_dict())
 
         if ep % log_interval == 0:
-            print(f"[TRAIN] ep={ep} eps={eps_by_ep(ep):.3f} return={ep_ret:.3f} foul={hero_foul} buf={len(buf)}")
+            # tqdmと被らないように print する（ログファイル用）
+            pbar.write(f"[TRAIN] ep={ep} eps={eps_by_ep(ep):.3f} return={ep_ret:.3f} avg100={avg_ret:.3f} foul100={foul_rate:.3f} buf={len(buf)}")
 
         if ep % save_interval == 0:
             os.makedirs(os.path.dirname(model_path), exist_ok=True)

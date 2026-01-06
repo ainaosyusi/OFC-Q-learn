@@ -296,6 +296,9 @@ class OFCMultiEnv:
             # 3pなら -40
             return -20.0 * (self.n_players - 1)
 
+        # ノンファウルボーナス
+        bonus = 2.0 * (self.n_players - 1)
+
         # 簡易スコア（後で本格採点に差し替え）
         def strength(p: PlayerBoard) -> float:
             t = eval_3(p.top)
@@ -313,4 +316,5 @@ class OFCMultiEnv:
                 score += 1.0
             else:
                 score += 1.0 if hero_s >= strength(p) else -1.0
-        return score
+        
+        return score + bonus
