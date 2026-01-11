@@ -182,6 +182,11 @@ class PlayerBoard:
         else: raise ValueError("row must be T/M/B")
 
     def evaluate_foul(self):
+        # 不完全な状態なら役判定できないので即フォール扱い
+        if len(self.top) != 3 or len(self.mid) != 5 or len(self.bot) != 5:
+            self.foul = True
+            return
+
         t_cat, t_tb = eval_3(self.top)
         m_cat, m_tb = eval_5(self.mid)
         b_cat, b_tb = eval_5(self.bot)
@@ -217,10 +222,15 @@ class OFCMultiEnv:
         self.hand: List[Card] = []
 
     def _deal_init(self):
-        self.hand = [self.deck.pop() for _ in range(5)]
+        need = min(5, 13)
+        self.hand = [self.deck.pop() for _ in range(need)]
 
     def _deal_next(self):
-        self.hand = [self.deck.pop() for _ in range(3)]
+        # 以降は 3 枚ずつ（残りスロットが足りない場合は不足分のみ）
+        hero = self.players[self.hero_idx]
+        remain = 13 - (len(hero.top) + len(hero.mid) + len(hero.bot))
+        need = max(0, min(3, remain))
+        self.hand = [self.deck.pop() for _ in range(need)] if need > 0 else []
 
     def reset(self) -> MultiOFCState:
         self.players = [PlayerBoard() for _ in range(self.n_players)]
@@ -266,14 +276,17 @@ class OFCMultiEnv:
         reward = 0.0
         info: Dict = {}
 
-        if self.turn == 4:
+        hero_cards = len(hero.top) + len(hero.mid) + len(hero.bot)
+        if hero_cards >= 13:
             done = True
             reward = self._compute_hero_reward()
             info["hero_foul"] = self.players[self.hero_idx].foul
             return self._get_state(), reward, done, info
 
-        self.turn += 1
-        self._deal_next()
+        if not self.hand:
+            self.turn += 1
+            self._deal_next()
+
         return self._get_state(), reward, done, info
 
     def _compute_hero_reward(self) -> float:
@@ -282,6 +295,9 @@ class OFCMultiEnv:
         if hero.foul:
             # 3pなら -40
             return -20.0 * (self.n_players - 1)
+
+        # ノンファウルボーナス
+        bonus = 2.0 * (self.n_players - 1)
 
         # 簡易スコア（後で本格採点に差し替え）
         def strength(p: PlayerBoard) -> float:
@@ -300,4 +316,5 @@ class OFCMultiEnv:
                 score += 1.0
             else:
                 score += 1.0 if hero_s >= strength(p) else -1.0
-        return score
+        
+        return score + bonus

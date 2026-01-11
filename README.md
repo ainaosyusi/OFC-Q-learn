@@ -48,3 +48,6 @@ python dqn_ofc_multi.py --train --episodes 50000 --n_players 3 --hero_idx 0 --se
 cd ~/OFC-Q-learn/OFC-Q-learn
 source ~/ofc_env/bin/activate
 mkdir -p demos ckpt logs
+
+
+python dqn_ofc_multi.py --train --episodes 20 --n_players 3 --hero_idx 0 --seed 11 --n_jokers 0 --model ./ckpt/tmp.pt
