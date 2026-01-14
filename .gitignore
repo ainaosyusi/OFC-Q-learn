@@ -3,12 +3,24 @@
 venv/
 __pycache__/
 *.pyc
+*$py.class
 
 # training artifacts
 ckpt/
 logs/
+demos/
 *.pt
 *.pth
+*.log
 
 # macOS
 .DS_Store
+.AppleDouble
+.LSOverride
+Icon
+
+
+# IDEs
+.vscode/
+.idea/
+
