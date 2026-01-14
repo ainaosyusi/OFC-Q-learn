@@ -1,50 +1,64 @@
-FC-Q-learn % mkdir -p ckpt
-python dqn_ofc.py --episodes 1000 --seed 11
+# OFC-Q-learn
 
-でとりあえず動かして
-# 例: パスを書き換えて新規で学習
-python dqn_ofc.py --episodes 5000 --seed 11
-# （dqn_ofc.py 内の save_path を "./ckpt/ofc_qnet_v2.pt" に変えておくと分かりやすい）
+Deep Q-Learning (DQN) を用いたオープンフェイス・チャイニーズポーカー (OFC) AI プロジェクト。
 
-python dqn_ofc.py --test
+本プロジェクトは、強化学習を用いて OFC パイナップル（JOPTルール相当）の高性能な AI プレイヤーを構築することを目的としています。2〜3人対戦、不完全情報、および構造的な役の制約（Top < Mid < Bot）といった複雑な課題に取り組んでいます。
 
+## 🚀 プロジェクト目標: ゼロからプロレベルへ
+- **戦略的意思決定**: 相手の公開カードを観測し、最適なカード配置を行います。
+- **制約の学習**: OFC の基本ルールを遵守し、ファウルを回避するように学習します。
+- **スケーラブルな学習**: ローカル環境およびクラウド (GCP) での学習をサポートしています。
 
-学習経過
-11/17　まだプレイが幼稚　ペアペアハイでギリ耐えできるレベル
+詳細な開発計画については、[ROADMAP.md](./ROADMAP.md) を参照してください。
 
-multi
-3. 使い方のイメージ
-ローカル or GCP で、multi_ofc_env.py と dqn_ofc_multi.py をプロジェクト直下に置いて：
-# 2人プレイで学習（hero=0）
-python dqn_ofc_multi.py --train --episodes 1000 --n_players 2 --hero_idx 0 --seed 11
+## 🛠 特徴
+- **環境**: 2〜3人プレイに対応したカスタム Gymnasium ライクな環境 (`multi_ofc_env.py`)。
+- **アルゴリズム**:
+    - **DQN**: 離散的なアクション空間におけるカード配置のための Deep Q-Network。
+    - **Behavior Cloning (BC)**: 人間のデモデータからの事前学習。
+- **プラットフォーム**:
+    - ローカル学習スクリプト。
+    - 長時間の実験のための GCP (Compute Engine) 連携スクリプト。
 
-# 学習済みモデルで1回だけ試す
-python dqn_ofc_multi.py --test --n_players 2 --hero_idx 0 --seed 11
-3人プレイなら：
-python dqn_ofc_multi.py --train --episodes 1000 --n_players 3 --hero_idx 0
+## 📦 インストール方法
 
-
-python dqn_ofc_multi.py --eval 1000 --n_players 2 --hero_idx 0 --seed 11
-
-# 実験A：2人戦、ベースライン
-python dqn_ofc_multi.py --train --episodes 50000 --n_players 2 --hero_idx 0 --seed 11
-
-# 実験B：3人戦
-python dqn_ofc_multi.py --train --episodes 50000 --n_players 3 --hero_idx 0 --seed 11
-
-
-------
-# OFC Human Demo → BC → RL 手順（最短）
-
-## 前提
-- repo: `~/OFC-Q-learn/OFC-Q-learn`
-- venv: `source ~/ofc_env/bin/activate`
-- 既存: `dqn_ofc_multi.py`, `multi_ofc_env.py` が動く
-
----
-
-## 0. 準備
 ```bash
-cd ~/OFC-Q-learn/OFC-Q-learn
-source ~/ofc_env/bin/activate
-mkdir -p demos ckpt logs
+# リポジトリのクローン
+git clone https://github.com/naoai/OFC-Q-learn.git
+cd OFC-Q-learn
+
+# 仮想環境の作成
+python -m venv venv
+source venv/bin/activate
+
+# 依存ライブラリのインストール
+pip install torch numpy tqdm
+```
+
+## 🏃 使い方
+
+### 学習 (マルチプレイヤー)
+```bash
+# 2人プレイでの学習 (ローカル)
+./scripts/run_local_train.sh
+
+# パラメータを指定して学習
+python dqn_ofc_multi.py --train --episodes 1000 --n_players 3 --hero_idx 0 --seed 11
+```
+
+### 評価
+```bash
+# 学習済みモデルを使用した評価
+python dqn_ofc_multi.py --eval 100 --n_players 2 --hero_idx 0 --model ./ckpt/ofc_qnet_v1.pt
+```
+
+## 📂 ファイル構成
+- `multi_ofc_env.py`: ゲームロジックと報酬システム。
+- `dqn_ofc_multi.py`: マルチプレイヤー環境向けの DQN 実装。
+- `train_bc.py`: 事前学習用 Behavior Cloning。
+- `scripts/`: 学習自動化用シェルスクリプト。
+- `ckpt/`: モデルチェックポイント保存先 (Git 除外)。
+- `logs/`: 学習ログ保存先 (Git 除外)。
+
+## 📄 ライセンス
+本プロジェクトは研究および教育目的で公開されています。
